@@ -1,16 +1,9 @@
-//  Agora RTC/MEDIA SDK
-//
-//  Created by Jay Zhang in 2020-04.
-//  Copyright (c) 2020 Agora.io. All rights reserved.
-//
-//  This sample demonstrates how to receive audio and video streams from a remote user,
-//  transcode them using FFmpeg, and push them to an RTMP server like YouTube.
-//
-//  The application is structured into three main threads:
-//  1. Audio Thread: Receives PCM audio, encodes it into AAC.
-//  2. Video Thread: Receives YUV video, encodes it into H.264.
-//  3. Muxing Thread: Takes encoded AAC and H.264 packets and sends them to the RTMP server.
-//
+/*
+1.增加启动超时机制，30秒内音视频编码器未初始化成功，打印错误日志后退出
+2.在视频处理线程 video_processing_thread 的末尾，增加了冲刷编码器的逻辑。它通过向编码器发送一个 nullptr 帧来告知数据流结束，然后循环接收编码器输出的所有剩余数据包。
+3.增加了运行时状态监控日志，每秒打印各个处理队列的当前大小
+4.改进资源清理逻辑，为PcmFrameObserver和YuvFrameObserver添加了独立的join(),在main函数中使用do-while(false)结构，将所有资源清理代码集中到循环体之后。无论程序是正常结束还是中途出错break，都能保证清理逻辑被完整执行，防止资源泄漏
+*/
 
 #include <csignal>
 #include <cstring>
@@ -240,9 +233,8 @@ public:
     }
 
     ~PcmFrameObserver() {
-        if (audio_thread_.joinable()) {
-            audio_thread_.join();
-        }
+        // The thread must be joined via the public join() method before this destructor is called
+        // to ensure a clean shutdown.
         cleanup_aac_encoder();
     }
 
@@ -267,6 +259,12 @@ public:
 
     AVCodecContext* get_codec_context() { return aac_encoder_ctx_; }
 
+    void join() {
+        if (audio_thread_.joinable()) {
+            audio_thread_.join();
+        }
+    }
+
 private:
     void audio_processing_thread();
     bool init_aac_encoder();
@@ -286,14 +284,13 @@ private:
 
 class YuvFrameObserver : public agora::rtc::IVideoFrameObserver2 {
 public:
-    YuvFrameObserver() : encoder_ctx_(nullptr), frame_(nullptr), sws_ctx_(nullptr), pts_(0) {
+    YuvFrameObserver() : encoder_ctx_(nullptr), frame_(nullptr), pts_(0) {
         video_thread_ = std::thread(&YuvFrameObserver::video_processing_thread, this);
     }
 
     ~YuvFrameObserver() {
-        if (video_thread_.joinable()) {
-            video_thread_.join();
-        }
+        // The thread must be joined via the public join() method before this destructor is called
+        // to ensure a clean shutdown.
         cleanup_h264_encoder();
     }
 
@@ -311,6 +308,13 @@ public:
 
     AVCodecContext* get_codec_context() { return encoder_ctx_; }
 
+    void join() {
+        if (video_thread_.joinable()) {
+            video_thread_.join();
+        }
+    }
+
+
 private:
     void video_processing_thread();
     bool init_h264_encoder(int width, int height);
@@ -319,7 +323,6 @@ private:
     std::thread video_thread_;
     AVCodecContext* encoder_ctx_;
     AVFrame* frame_;
-    SwsContext* sws_ctx_;
     int64_t pts_;
 };
 
@@ -338,6 +341,7 @@ bool PcmFrameObserver::init_aac_encoder() {
     aac_encoder_ctx_ = avcodec_alloc_context3(encoder);
     if (!aac_encoder_ctx_) {
         AG_LOG(ERROR, "Failed to allocate AAC encoder context");
+        cleanup_aac_encoder();
         return false;
     }
 
@@ -354,6 +358,7 @@ bool PcmFrameObserver::init_aac_encoder() {
 
     if (avcodec_open2(aac_encoder_ctx_, encoder, nullptr) < 0) {
         AG_LOG(ERROR, "Failed to open AAC encoder");
+        cleanup_aac_encoder();
         return false;
     }
 
@@ -363,6 +368,7 @@ bool PcmFrameObserver::init_aac_encoder() {
                                   0, nullptr);
     if (!swr_ctx_ || swr_init(swr_ctx_) < 0) {
         AG_LOG(ERROR, "Failed to initialize resampler");
+        cleanup_aac_encoder();
         return false;
     }
 
@@ -373,12 +379,14 @@ bool PcmFrameObserver::init_aac_encoder() {
     audio_frame_->sample_rate = aac_encoder_ctx_->sample_rate;
     if (av_frame_get_buffer(audio_frame_, 0) < 0) {
         AG_LOG(ERROR, "Failed to allocate audio frame buffer");
+        cleanup_aac_encoder();
         return false;
     }
 
     audio_fifo_ = av_audio_fifo_alloc(aac_encoder_ctx_->sample_fmt, aac_encoder_ctx_->channels, 1);
     if (!audio_fifo_) {
         AG_LOG(ERROR, "Failed to allocate audio FIFO");
+        cleanup_aac_encoder();
         return false;
     }
     return true;
@@ -478,18 +486,19 @@ void PcmFrameObserver::audio_processing_thread() {
 
 
 bool YuvFrameObserver::init_h264_encoder(int width, int height) {
-    const AVCodec* encoder = avcodec_find_encoder(AV_CODEC_ID_H264);
+    const AVCodec* encoder = avcodec_find_encoder_by_name("libx264");
     if (!encoder) {
-        AG_LOG(ERROR, "Cannot find H264 encoder");
+        AG_LOG(ERROR, "Cannot find libx264 encoder");
         return false;
     }
     encoder_ctx_ = avcodec_alloc_context3(encoder);
     if (!encoder_ctx_) {
         AG_LOG(ERROR, "Failed to allocate encoder context");
+        cleanup_h264_encoder();
         return false;
     }
 
-    encoder_ctx_->bit_rate = 2000000;
+    encoder_ctx_->bit_rate = 10000000; // Use a more reasonable bitrate for software encoding
     encoder_ctx_->width = width;
     encoder_ctx_->height = height;
     encoder_ctx_->time_base = {1, 20}; // Common timebase for video
@@ -497,11 +506,12 @@ bool YuvFrameObserver::init_h264_encoder(int width, int height) {
     encoder_ctx_->gop_size = 40;
     encoder_ctx_->max_b_frames = 0; // No B-frames for low latency
     encoder_ctx_->pix_fmt = AV_PIX_FMT_YUV420P;
-    av_opt_set(encoder_ctx_->priv_data, "preset", "veryfast", 0);
+    av_opt_set(encoder_ctx_->priv_data, "preset", "ultrafast", 0);
     av_opt_set(encoder_ctx_->priv_data, "tune", "zerolatency", 0);
 
     if (avcodec_open2(encoder_ctx_, encoder, nullptr) < 0) {
         AG_LOG(ERROR, "Failed to open H264 encoder");
+        cleanup_h264_encoder();
         return false;
     }
 
@@ -511,6 +521,7 @@ bool YuvFrameObserver::init_h264_encoder(int width, int height) {
     frame_->height = encoder_ctx_->height;
     if (av_frame_get_buffer(frame_, 32) < 0) {
         AG_LOG(ERROR, "Failed to allocate frame buffer");
+        cleanup_h264_encoder();
         return false;
     }
     return true;
@@ -519,7 +530,6 @@ bool YuvFrameObserver::init_h264_encoder(int width, int height) {
 void YuvFrameObserver::cleanup_h264_encoder() {
     if (encoder_ctx_) avcodec_free_context(&encoder_ctx_);
     if (frame_) av_frame_free(&frame_);
-    if (sws_ctx_) sws_freeContext(sws_ctx_);
 }
 
 void YuvFrameObserver::video_processing_thread() {
@@ -539,25 +549,27 @@ void YuvFrameObserver::video_processing_thread() {
                 delete videoFrame;
                 continue;
             }
-            // Create SwsContext
-            sws_ctx_ = sws_getContext(videoFrame->width, videoFrame->height, AV_PIX_FMT_YUV420P, 
-                                      encoder_ctx_->width, encoder_ctx_->height, encoder_ctx_->pix_fmt, 
-                                      SWS_BILINEAR, NULL, NULL, NULL);
-            if (!sws_ctx_) {
-                AG_LOG(ERROR, "Failed to create SwsContext");
-                break;
-            }
             encoder_initialized = true;
         }
 
         if (av_frame_make_writable(frame_) < 0) continue;
 
-        // Use sws_scale for robust conversion
-        const uint8_t* const src_data[4] = { videoFrame->yBuffer, videoFrame->uBuffer, videoFrame->vBuffer, NULL };
-        const int src_linesize[4] = { (int)videoFrame->yStride, (int)videoFrame->uStride, (int)videoFrame->vStride, 0 };
+        // Since Agora provides YUV420P frames and our encoder uses the same format without resizing,
+        // we can copy the planes directly, handling potential stride differences.
+        // This avoids an unnecessary sws_scale operation.
+        // Y plane
+        for (int i = 0; i < frame_->height; i++) {
+            memcpy(frame_->data[0] + i * frame_->linesize[0], videoFrame->yBuffer + i * videoFrame->yStride, frame_->width);
+        }
+        // U plane
+        for (int i = 0; i < frame_->height / 2; i++) {
+            memcpy(frame_->data[1] + i * frame_->linesize[1], videoFrame->uBuffer + i * videoFrame->uStride, frame_->width / 2);
+        }
+        // V plane
+        for (int i = 0; i < frame_->height / 2; i++) {
+            memcpy(frame_->data[2] + i * frame_->linesize[2], videoFrame->vBuffer + i * videoFrame->vStride, frame_->width / 2);
+        }
 
-        sws_scale(sws_ctx_, src_data, src_linesize, 0, videoFrame->height, frame_->data, frame_->linesize);
-        
         frame_->pts = pts_++;
 
         if (avcodec_send_frame(encoder_ctx_, frame_) < 0) continue;
@@ -580,6 +592,26 @@ void YuvFrameObserver::video_processing_thread() {
         delete videoFrame->vBuffer;
         delete videoFrame;
     }
+
+    // Flush the encoder to get any remaining packets
+    if (encoder_initialized) {
+        AG_LOG(INFO, "Flushing video encoder...");
+        // Send a null frame to the encoder to signal end of stream
+        if (avcodec_send_frame(encoder_ctx_, nullptr) >= 0) {
+            while (true) {
+                AVPacket* pkt = av_packet_alloc();
+                int ret = avcodec_receive_packet(encoder_ctx_, pkt);
+                if (ret == AVERROR(EAGAIN) || ret == AVERROR_EOF) {
+                    av_packet_free(&pkt);
+                    break;
+                } else if (ret < 0) {
+                    av_packet_free(&pkt);
+                    break;
+                }
+                muxer_queue.push({pkt, AVMEDIA_TYPE_VIDEO});
+            }
+        }
+    }
 }
 
 // ================== Main Function ==================
@@ -593,6 +625,16 @@ static void SignalHandler(int sigNo) {
 
 int main(int argc, char* argv[]) {
     SampleOptions options;
+    int ret = 0;
+
+    // --- Resource Declarations ---
+    agora::base::IAgoraService* service = nullptr;
+    agora::agora_refptr<agora::rtc::IRtcConnection> connection = nullptr;
+    std::shared_ptr<SampleConnectionObserver> connObserver;
+    std::shared_ptr<SampleLocalUserObserver> localUserObserver;
+    std::shared_ptr<PcmFrameObserver> pcmFrameObserver;
+    std::shared_ptr<YuvFrameObserver> yuvFrameObserver;
+    std::thread muxer_thread;
     opt_parser optParser;
 
     optParser.add_long_opt("token", &options.token, "Token for authentication");
@@ -613,96 +655,146 @@ int main(int argc, char* argv[]) {
 
     if (options.token.empty() || options.channelId.empty() || options.rtmpUrl.empty()) {
         AG_LOG(ERROR, "Must provide token, channelId, and rtmpUrl!");
-        return -1;
+        ret = -1;
     }
 
     std::signal(SIGQUIT, SignalHandler);
     std::signal(SIGABRT, SignalHandler);
     std::signal(SIGINT, SignalHandler);
 
-    auto service = createAndInitAgoraService(false, true, true);
-    if (!service) {
-        AG_LOG(ERROR, "Failed to create Agora service!");
-        return -1;
-    }
+    // Use a do-while(false) loop for centralized resource cleanup
+    do {
+        if (ret != 0) break;
 
-    agora::rtc::RtcConnectionConfiguration ccfg;
-    ccfg.clientRoleType = agora::rtc::CLIENT_ROLE_BROADCASTER;
-    ccfg.autoSubscribeAudio = false;
-    ccfg.autoSubscribeVideo = false;
+        service = createAndInitAgoraService(false, true, true);
+        if (!service) {
+            AG_LOG(ERROR, "Failed to create Agora service!");
+            ret = -1; break;
+        }
 
-    auto connection = service->createRtcConnection(ccfg);
-    if (!connection) {
-        AG_LOG(ERROR, "Failed to create Agora connection!");
-        return -1;
-    }
+        agora::rtc::RtcConnectionConfiguration ccfg;
+        ccfg.clientRoleType = agora::rtc::CLIENT_ROLE_BROADCASTER;
+        ccfg.autoSubscribeAudio = false;
+        ccfg.autoSubscribeVideo = false;
 
-    auto connObserver = std::make_shared<SampleConnectionObserver>();
-    connection->registerObserver(connObserver.get());
-    
-    auto localUserObserver = std::make_shared<SampleLocalUserObserver>(connection->getLocalUser());
+        connection = service->createRtcConnection(ccfg);
+        if (!connection) {
+            AG_LOG(ERROR, "Failed to create Agora connection!");
+            ret = -1; break;
+        }
 
-    // Subscribe to remote user
-    agora::rtc::VideoSubscriptionOptions subscriptionOptions;
-    subscriptionOptions.type = (options.streamType == STREAM_TYPE_HIGH) ? agora::rtc::VIDEO_STREAM_HIGH : agora::rtc::VIDEO_STREAM_LOW;
-    if (options.remoteUserId.empty()) {
-        connection->getLocalUser()->subscribeAllAudio();
-        connection->getLocalUser()->subscribeAllVideo(subscriptionOptions);
-    } else {
-        connection->getLocalUser()->subscribeAudio(options.remoteUserId.c_str());
-        connection->getLocalUser()->subscribeVideo(options.remoteUserId.c_str(), subscriptionOptions);
-    }
+        connObserver = std::make_shared<SampleConnectionObserver>();
+        connection->registerObserver(connObserver.get());
+        
+        localUserObserver = std::make_shared<SampleLocalUserObserver>(connection->getLocalUser());
 
-    // Create observers
-    auto pcmFrameObserver = std::make_shared<PcmFrameObserver>(options.audio.sampleRate, options.audio.numOfChannels);
-    auto yuvFrameObserver = std::make_shared<YuvFrameObserver>();
+        // Subscribe to remote user
+        agora::rtc::VideoSubscriptionOptions subscriptionOptions;
+        subscriptionOptions.type = (options.streamType == STREAM_TYPE_HIGH) ? agora::rtc::VIDEO_STREAM_HIGH : agora::rtc::VIDEO_STREAM_LOW;
+        if (options.remoteUserId.empty()) {
+            connection->getLocalUser()->subscribeAllAudio();
+            connection->getLocalUser()->subscribeAllVideo(subscriptionOptions);
+        } else {
+            connection->getLocalUser()->subscribeAudio(options.remoteUserId.c_str());
+            connection->getLocalUser()->subscribeVideo(options.remoteUserId.c_str(), subscriptionOptions);
+        }
 
-    // Register observers
-    if (connection->getLocalUser()->setPlaybackAudioFrameBeforeMixingParameters(options.audio.numOfChannels, options.audio.sampleRate)) {
-        AG_LOG(ERROR, "Failed to set audio frame parameters!");
-    }
-    localUserObserver->setAudioFrameObserver(pcmFrameObserver.get());
-    localUserObserver->setVideoFrameObserver(yuvFrameObserver.get());
+        pcmFrameObserver = std::make_shared<PcmFrameObserver>(options.audio.sampleRate, options.audio.numOfChannels);
+        yuvFrameObserver = std::make_shared<YuvFrameObserver>();
 
-    if (connection->connect(options.token.c_str(), options.channelId.c_str(), options.userId.c_str())) {
-        AG_LOG(ERROR, "Failed to connect to Agora channel!");
-        return -1;
-    }
+        if (connection->getLocalUser()->setPlaybackAudioFrameBeforeMixingParameters(options.audio.numOfChannels, options.audio.sampleRate)) {
+            AG_LOG(ERROR, "Failed to set audio frame parameters!");
+            ret = -1; break;
+        }
+        localUserObserver->setAudioFrameObserver(pcmFrameObserver.get());
+        localUserObserver->setVideoFrameObserver(yuvFrameObserver.get());
 
-    AG_LOG(INFO, "Connected to Agora channel. Waiting for media streams...");
+        if (connection->connect(options.token.c_str(), options.channelId.c_str(), options.userId.c_str())) {
+            AG_LOG(ERROR, "Failed to connect to Agora channel!");
+            ret = -1; break;
+        }
 
-    // Wait for encoders to be initialized
-    AVCodecContext* video_codec_ctx = nullptr;
-    AVCodecContext* audio_codec_ctx = nullptr;
-    while (!muxer_queue.is_exiting() && (!video_codec_ctx || !audio_codec_ctx)) {
-        if (!video_codec_ctx) video_codec_ctx = yuvFrameObserver->get_codec_context();
-        if (!audio_codec_ctx) audio_codec_ctx = pcmFrameObserver->get_codec_context();
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+        AG_LOG(INFO, "Connected to Agora channel. Waiting for media streams...");
 
-    std::thread muxer_thread;
-    if (!muxer_queue.is_exiting()) {
-        muxer_thread = std::thread(muxing_thread_func, options.rtmpUrl.c_str(), video_codec_ctx, audio_codec_ctx);
-    }
+        AVCodecContext* video_codec_ctx = nullptr;
+        AVCodecContext* audio_codec_ctx = nullptr;
+        const auto timeout_duration = std::chrono::seconds(30);
+        auto start_time = std::chrono::steady_clock::now();
+        bool timed_out = false;
 
-    // Main loop
-    while (!muxer_queue.is_exiting()) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(100));
-    }
+        while (!muxer_queue.is_exiting() && (!video_codec_ctx || !audio_codec_ctx)) {
+            if (!video_codec_ctx) video_codec_ctx = yuvFrameObserver->get_codec_context();
+            if (!audio_codec_ctx) audio_codec_ctx = pcmFrameObserver->get_codec_context();
+
+            if (std::chrono::steady_clock::now() - start_time > timeout_duration) {
+                AG_LOG(ERROR, "Timeout waiting for media encoders to initialize.");
+                if (!video_codec_ctx) AG_LOG(ERROR, "Video encoder failed to initialize.");
+                if (!audio_codec_ctx) AG_LOG(ERROR, "Audio encoder failed to initialize.");
+                timed_out = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+        if (!muxer_queue.is_exiting() && !timed_out) {
+            muxer_thread = std::thread(muxing_thread_func, options.rtmpUrl.c_str(), video_codec_ctx, audio_codec_ctx);
+        } else {
+            SignalHandler(SIGTERM); // Trigger graceful shutdown
+            if (timed_out) ret = -1;
+        }
+
+        auto last_log_time = std::chrono::steady_clock::now();
+        while (!muxer_queue.is_exiting()) {
+            auto now = std::chrono::steady_clock::now();
+            if (std::chrono::duration_cast<std::chrono::seconds>(now - last_log_time).count() >= 1) {
+                AG_LOG(INFO, "Queue sizes -> Video: %d, Audio: %d, Muxer: %d", 
+                       video_queue.size(), audio_queue.size(), muxer_queue.size());
+                last_log_time = now;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+
+    } while (false);
 
     AG_LOG(INFO, "Exiting...");
 
-    // Cleanup
-    if (muxer_thread.joinable()) muxer_thread.join();
-    
-    connection->unregisterObserver(connObserver.get());
-    localUserObserver->unsetAudioFrameObserver();
-    localUserObserver->unsetVideoFrameObserver();
-
-    if (connection->disconnect()) {
-        AG_LOG(ERROR, "Failed to disconnect from Agora channel!");
+    // --- Cleanup ---
+    // Explicitly join all threads before destroying observers.
+    // This prevents hangs if a thread is stuck, and avoids relying on destructor order.
+    if (muxer_thread.joinable()) {
+        muxer_thread.join();
+    }
+    if (pcmFrameObserver) {
+        pcmFrameObserver->join();
+    }
+    if (yuvFrameObserver) {
+        yuvFrameObserver->join();
     }
 
-    service->release();
-    return 0;
+    pcmFrameObserver.reset();
+    yuvFrameObserver.reset();
+
+    if (connection) {
+        if (connObserver) {
+            connection->unregisterObserver(connObserver.get());
+        }
+        if (localUserObserver) {
+            localUserObserver->unsetAudioFrameObserver();
+            localUserObserver->unsetVideoFrameObserver();
+        }
+        if (connection->disconnect()) {
+            AG_LOG(ERROR, "Failed to disconnect from Agora channel!");
+            if (ret == 0) ret = -1;
+        }
+    }
+
+    localUserObserver.reset();
+    connObserver.reset();
+    connection = nullptr;
+
+    if (service) {
+        service->release();
+    }
+
+    return ret;
 }
