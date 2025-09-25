@@ -54,8 +54,8 @@ class ConversationState(Enum):
 class SileroVAD:
     """Silero VAD语音活动检测"""
     
-    def __init__(self, model_path: str, threshold: float = 0.02, threshold_low: float = 0.005):
-        self.threshold = threshold
+    def __init__(self, model_path: str, threshold: float = 0.04, threshold_low: float = 0.005):
+        self.threshold = threshold # 进一步提高阈值以降低敏感度
         self.threshold_low = threshold_low
         self.sample_rate = 16000
         self.frame_size = 512  # 32ms @ 16kHz
@@ -200,7 +200,7 @@ class AgoraConversationSystem:
     def __init__(self,
                  asr_model_dir: str = "../models/sherpa-onnx-whisper-base.en",
                  vad_model_dir: str = "../models/snakers4_silero-vad",
-                 vad_threshold: float = 0.02,
+                 vad_threshold: float = 0.1, # 统一默认值为0.1
                  vad_threshold_low: float = 0.005,
                  sample_rate: int = 16000):
         
@@ -227,12 +227,16 @@ class AgoraConversationSystem:
         self.is_speaking = False
         self.speech_chunk_count = 0
         self.silence_chunk_count = 0
-        self.min_speech_chunks = 1      # 最小连续语音块数 (1块=32ms)
-        self.max_silence_chunks = 10    # 最大连续静音块数 (10块=320ms)
+        self.min_speech_chunks = 7      # 最小连续语音块数 (7块=224ms)
+        self.max_silence_chunks = 15    # 最大连续静音块数 (15块=480ms)，增加此值可容忍更长的停顿
         
         # 语音收集
         self.is_collecting_speech = False
         self.speech_buffer = []
+
+        # 前置缓冲区，用于捕获语音开始前的音频
+        self.pre_buffer_duration_ms = 200  # 缓存200ms的音频
+        self.pre_buffer = deque(maxlen=int(self.sample_rate * self.pre_buffer_duration_ms / 1000))
         
         # 统计信息
         self.total_chunks = 0
@@ -268,6 +272,10 @@ class AgoraConversationSystem:
         if has_voice:
             self.voice_chunks += 1
 
+        # 无论是否有语音，都填充前置缓冲区
+        if not self.is_collecting_speech:
+            self.pre_buffer.extend(audio_chunk)
+
         # VAD状态机
         speech_start = False
         speech_end = False
@@ -292,6 +300,8 @@ class AgoraConversationSystem:
             print(f"🎤 开始监听语音...")
             self.speech_buffer = []
             self.is_collecting_speech = True
+            # 将前置缓冲区的内容加入语音缓冲区，以捕获完整的句子开头
+            self.speech_buffer = list(self.pre_buffer)
 
         if self.is_collecting_speech:
             self.speech_buffer.extend(audio_chunk)
@@ -301,7 +311,7 @@ class AgoraConversationSystem:
             print(f"🔇 语音结束，时长: {speech_duration:.2f}s")
             self.is_collecting_speech = False
 
-            if len(self.speech_buffer) > self.sample_rate * 0.3:  # 最小语音时长：0.3秒
+            if len(self.speech_buffer) > self.sample_rate * 0.5:  # 最小语音时长：0.5秒
                 print(f"📝 开始语音识别...")
                 self.set_state(ConversationState.RECOGNIZING)
 
@@ -336,6 +346,16 @@ class AgoraConversationSystem:
 
             print(f"🤖 AI回复: {gpt_reply} (思考耗时: {gpt_time:.2f}s)")
 
+            # --- ！！！在这里集成TTS和SPEAKING状态 !!! ---
+            # self.set_state(ConversationState.SPEAKING)
+            # print("🔊 正在播放AI回复...")
+            #
+            # # 伪代码：调用TTS引擎播放语音
+            # # tts_engine.play(gpt_reply)
+            #
+            # print("✅ 回复播放完成")
+            # -----------------------------------------
+
             self.conversation_count += 1
 
             # 回到监听状态
@@ -356,7 +376,7 @@ _conversation_system: Optional[AgoraConversationSystem] = None
 
 def bridge_initialize(asr_model_dir: str = None,
                      vad_model_dir: str = None,
-                     vad_threshold: float = 0.02,
+                     vad_threshold: float = 0.1, # 确认此处的默认值为0.1
                      vad_threshold_low: float = 0.005,
                      sample_rate: int = 16000) -> bool:
     """C++调用的初始化函数"""
