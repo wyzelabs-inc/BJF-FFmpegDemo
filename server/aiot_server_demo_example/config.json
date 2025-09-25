@@ -1,0 +1,47 @@
+
+{
+    
+    "app_id": "声网appid",
+    "app_certificate": "声网证书",
+    "customer_key": "客户密钥",
+    "customer_secret": "客户密钥",
+    "asr": {
+        "language": "zh-CN"
+    },
+    "parameters": {
+        "output_audio_codec": "G722",   
+        "transcript": {
+            "enable": false
+        }
+    },
+    "tts": {
+        "vendor": "tencent",
+        "params": {
+            "app_id": "1371543312",
+            "secret_id": "tts id",
+            "secret_key": "tts key",
+            "voice_type": 601005,
+            "volume": 5,
+            "speed": 1.25,
+            "emotion_category": "happy",
+            "emotion_intensity": 100
+        }
+    },
+    "idle_timeout": 30,
+    "llm": {
+        "url": "https://api.openai.com/v1/chat/completions",
+        "params": {
+            "model": "gpt-3.5-turbo"
+        },
+        "api_key": "gptkey",
+        "system_messages": [
+            {
+                "role": "system",
+                "content": "You are a helpful chatbot."
+            }
+        ],
+        "max_history": 10,
+        "greeting_message": "你好，我是gpt，有什么可以帮助你的吗？",
+        "failure_message": "抱歉，我暂时无法回答您的问题，您可以尝试换个问题或者联系人工客服。"
+    }
+}
